@@ -58,7 +58,8 @@ class Parser(object):
             prop_many = prop.attrib['many'] if 'many' in prop.attrib else False
             prop_couldbe = prop.attrib['couldbe'].split('|') if 'couldbe' in prop.attrib else []
             prop_values = set(prop.attrib['values'].split(',')) if 'values' in prop.attrib else None
-
+            prop_separator = prop.attrib['separator'] if 'separator' in prop.attrib else ""
+            
             # Select all properties, but exclude nested properties
             prop_expr = 'descendant-or-self::*[contains(concat(" ", normalize-space(@%s), " "), " %s ")]' % (prop_attr, prop_name)
             parent_expr = 'ancestor::*[contains(concat(" ", normalize-space(@class), " "), " %s ")]' % format.tag
@@ -66,16 +67,16 @@ class Parser(object):
 
             # missing something required?
             if self.strict and not prop_nodes and prop_mandatory:
-                err = ParseError("missing mandatory %s property: %s" % (format.tag, prop_name), node.sourceline )
+                err = ParseError("missing mandatory %s property: %s" % (format.tag, prop_name), node.sourceline)
                 if self.collect_errors:
-                    self.errors.append( err )
+                    self.errors.append(err)
                     continue
                 else:
                     raise err
 
             if prop_many == 'many':
                 values = []
-            elif prop_many == "manyasone":
+            elif prop_many == 'manyasone':
                 values = ""
 
             # for each node matching the property we're looking for...
@@ -95,6 +96,7 @@ class Parser(object):
                         except:
                             pass
 
+                    # Check if this property is a compound property
                     if len(prop):
                         try:
                             prop_result = self._parse_node(prop_node, prop)
@@ -145,28 +147,36 @@ class Parser(object):
                             value['datetime'] = isodate.parse_datetime(self._parse_value(prop_node))
 
                         else:
-                            # treat type as a full format
+                            # Try to parse this property as a sub-format
                             results = self.parse_format(prop_type, prop_node)
                             if results and len(results[0]) > 1:
                                 value = results[0]
                             else:
-                                raise Exception("Could not parse expected format: '%s'" % (prop_type,) )
+                                raise Exception("Could not parse expected format: '%s'" % (prop_type,))
 
                 except Exception, e:
                     if self.strict:
-                        err = ParseError("Error parsing value for property '%s': %s" % (prop_name, e), sourceline=prop_node.sourceline )
+                        err = ParseError("Error parsing value for property '%s': %s" % (prop_name, e), sourceline=prop_node.sourceline)
                         if self.collect_errors:
-                            self.errors.append( err )
+                            self.errors.append(err)
                             continue    # go on to next property
                         else:
                             raise err
                     else:
                         value = self._parse_value(prop_node)
 
-                if self.strict and prop_values and value.lower() not in prop_values:
+                # Convert the value to a string (if it isn't one already)
+                if isinstance(value, basestring):
+                    value_text = value
+                elif 'text' in value:
+                    value_text = value['text']
+                else:
+                    value_text = ""
+
+                if self.strict and prop_values and value_text.lower() not in prop_values:
                     err = ParseError("Invalid value for property '%s': %s" % (prop_name, value))
                     if self.collect_errors:
-                        self.errors.append( err )
+                        self.errors.append(err)
                         continue    # go on to next property
                     else:
                         raise err
@@ -175,11 +185,11 @@ class Parser(object):
                     values.append(value)
 
                 elif prop_many == 'manyasone':
-                    if isinstance(value, basestring):
-                        if values and 'separator' in prop.attrib:
-                            values += prop.attrib['separator']
+                    if value_text:
+                        if values and prop_separator:
+                            values += prop_separator
 
-                        values += value
+                        values += value_text
 
                 else:
                     result[prop_name] = value
@@ -194,6 +204,7 @@ class Parser(object):
         value_expr = 'descendant::*[contains(concat(" ", normalize-space(@class), " "), " value ")]'
         value_nodes = node.xpath(value_expr)
 
+        # Check for various methods to override the tag text
         if value_nodes:
             return " ".join(self._parse_text(value_node) for value_node in value_nodes)
 
