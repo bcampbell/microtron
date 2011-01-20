@@ -14,6 +14,9 @@ def parse(argv = None):
         argv = sys.argv
 
     parser = OptionParser('usage: %prog <file> <format>')
+    parser.add_option("-s", "--strict",
+                  action="store_true", dest="strict", default=False,
+                  help="be strict about parsing")
     options, arguments = parser.parse_args(argv[1:])
     if len(arguments) != 2:
         parser.error('Incorrect number of arguments')
@@ -22,7 +25,7 @@ def parse(argv = None):
     format = arguments[1]
 
     tree = lxml.html.parse(source_filename)
-    pprint.pprint(Parser(tree).parse_format(format))
+    pprint.pprint(Parser(tree, strict=options.strict).parse_format(format))
 
 if __name__ == '__main__':
     sys.exit(parse())
