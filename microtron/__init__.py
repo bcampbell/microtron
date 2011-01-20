@@ -52,7 +52,7 @@ class Parser(object):
         result = {'__type__': format.tag}
         for prop in format:
             prop_name = prop.tag
-            prop_type = prop.attrib['type'] if 'type' in prop.attrib else None
+            prop_type = prop.attrib['type'] if 'type' in prop.attrib else 'text'
             prop_mandatory = True if 'mandatory' in prop.attrib and prop.attrib['mandatory'] == 'yes' else False
             prop_attr = prop.attrib['attribute'] if 'attribute' in prop.attrib else 'class'
             prop_many = prop.attrib['many'] if 'many' in prop.attrib else False
@@ -111,7 +111,8 @@ class Parser(object):
                     if not value:
                         value['__type__'] = prop_type
                         value['__srcline__'] = prop_node.sourceline
-                        if not prop_type or prop_type == 'text':
+
+                        if prop_type == 'text':
                             value = self._parse_value(prop_node)
 
                         elif prop_type in ('url', 'email'):
