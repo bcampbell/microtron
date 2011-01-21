@@ -2,7 +2,8 @@ __import__('pkg_resources').declare_namespace(__name__)
 
 import isodate, re, os
 import lxml.etree
-
+import datetime
+import pytz
 
 class ParseError(Exception):
     def __init__(self, message, sourceline=None):
@@ -11,14 +12,21 @@ class ParseError(Exception):
 
 class Parser(object):
     def __init__(self, tree, formats=None, strict=False, collect_errors=False):
-        # if collect_errors is True, exceptions will be trapped and
-        # accumulated in self.errors
+        """set up parser
+
+        tree    -- the document that we are going to parse
+        formats -- the microformat definitions (if None, load from mf.xml)
+        strict  -- if True, parser will be in pedantic try-to-follow-the-specs mode.
+                   if False, parser aims to be loose enough for real-world use
+        collect_errors -- collect parsing errors rather than raising them
+                   as exceptions, and try to continue parsing
+        """
         self.root = tree
         self.formats = formats
         self.strict = strict
         self.collect_errors = collect_errors
         self.errors = []
-        if not formats:
+        if formats is None:
             path = os.path.abspath(os.path.dirname(__file__))
             fname = os.path.join(path, 'mf.xml')
             self.formats = lxml.etree.parse(fname)
@@ -27,7 +35,7 @@ class Parser(object):
         root = root if root is not None else self.root
         format = self.formats.xpath('/microformats/*[@name="%s"] | /microformats/%s' % (mf, mf))
         if not format:
-            return None
+            raise Exception( "unknown format '%s'" % (mf) )
         else:
             format = format[0]
 
@@ -141,11 +149,12 @@ class Parser(object):
 
                         elif prop_type == 'date':
                             value['text'] = self._parse_text(prop_node)
-                            value['date'] = isodate.parse_date(self._parse_value(prop_node))
+                            # TODO: do we need a date-specific parsing fn which barfs if a time is included?
+                            value['date'] = self._parse_datetime_value(prop_node)
 
                         elif prop_type == 'datetime':
                             value['text'] = self._parse_text(prop_node)
-                            value['datetime'] = isodate.parse_datetime(self._parse_value(prop_node))
+                            value['datetime'] = self._parse_datetime_value(prop_node)
 
                         else:
                             # Try to parse this property as a sub-format
@@ -155,6 +164,10 @@ class Parser(object):
                             else:
                                 raise Exception("Could not parse expected format: '%s'" % (prop_type,))
 
+                # TODO: revamp exception handling - BenC
+                # this isn't the place to catch/collect the errors. they should
+                # be caught further down, where the code is better able to
+                # continue parsing.
                 except Exception, e:
                     if self.strict:
                         err = ParseError("Error parsing value for property '%s': %s" % (prop_name, e), sourceline=prop_node.sourceline)
@@ -201,20 +214,251 @@ class Parser(object):
 
         return result
 
+
+
+    def _find_value_nodes(self, node):
+        """ find child value nodes, according to value-class-pattern """
+        # look for class="value" and class="value-title"
+        # TODO: bug: this will pick up nested "value" elements.
+        #       value-class-pattern says that nested values shouldn't be used
+        value_expr = 'descendant::*[contains(concat(" ", normalize-space(@class), " "), " value ")] | descendant::*[contains(concat(" ", normalize-space(@class), " "), " value-title ")]'
+        return node.xpath(value_expr)
+
+
+
+
     def _parse_value(self, node):
-        value_expr = 'descendant::*[contains(concat(" ", normalize-space(@class), " "), " value ")]'
-        value_nodes = node.xpath(value_expr)
+        """ get a value from a node, handling (optional) value-class-pattern """
 
-        # Check for various methods to override the tag text
-        if value_nodes:
-            return " ".join(self._parse_text(value_node) for value_node in value_nodes)
+        value_nodes = self._find_value_nodes(node)
+        if not value_nodes:
+            # no value-class-pattern - just use element itself as value
+            return self._get_value_frag(node)
+        return "".join( [self._get_value_frag(n) for n in value_nodes] )
 
-        elif node.tag == 'abbr' and 'title' in node.attrib:
-            return node.attrib['title']
 
-        else:
-            return self._parse_text(node)
+
+    def _parse_datetime_value(self, node):
+        """ get a datetime value from a node, handling (optional) value-class-pattern """
+
+        value_nodes = self._find_value_nodes(node)
+
+        if not value_nodes:
+            # no value-class-pattern - just use element itself
+            # try for full isodate, then just date
+            txt = self._get_value_frag(node).strip()
+            dt = self._eval_as_datetime(txt)
+            if dt is None:
+                dt = self._eval_as_date(txt)
+            return dt
+
+        date_part = None
+        time_part = None
+        tzinfo_part = None
+        for n in value_nodes:
+            txt = self._get_value_frag(n).strip()
+
+            # try bare timezone
+            obj = self._eval_as_tzinfo(txt)
+            if obj is not None:
+                if tzinfo_part is None:
+                    tzinfo_part = obj
+                else:
+                    pass # should warn about multiple times in strict mode?
+                continue
+
+            # try time (+optional timezone)
+            obj = self._eval_as_time(txt)
+            if obj is not None:
+                if time_part is None:
+                    time_part = obj
+                else:
+                    pass # should warn about multiple times in strict mode?
+                continue
+
+            # try bare date
+            obj = self._eval_as_date(txt)
+            if obj is not None:
+                if date_part is None:
+                    date_part = obj
+                else:
+                    pass # should warn about multiple times in strict mode?
+                continue
+
+
+            # if we get this far we've not been able use fragment as part of
+            # a datetime...
+            if self.strict:
+                err = ParseError("Bad datetime value '%s'" % (txt), sourceline=n.sourceline)
+                if self.collect_errors:
+                   self.errors.append(err)
+                else:
+                   raise err
+
+        # now assemble the fragments we've accumulated
+        if time_part is None:
+            time_part = datetime.time(0,0,0,0,tzinfo_part)
+        if date_part is None:
+            raise Exception("missing date")
+        return datetime.datetime.combine(date_part, time_part)
+
+
+
+
+
+
+    def _get_value_frag(self, n):
+        """ get a value fragment from a single element """
+
+        if n.tag =='abbr' or ('value-title' in n.attrib['class']):
+            # value is in title attr.
+            if 'title' in n.attrib:
+                return n.attrib['title']
+            else:
+                if self.strict:
+                    err = ParseError("missing required 'title' attr on '%s' value element" % (n.tag), sourceline=n.sourceline)
+                    if self.collect_errors:
+                        self.errors.append(err)
+                        return ''   # just to allow parsing to continue
+                    else:
+                       raise err
+                else:
+                    return ''
+
+        if n.tag in ('img','area'):
+            if 'alt' in n.attrib:
+                return n.attrib['alt']
+            else:
+                if self.strict:
+                    err = ParseError("missing required 'alt' attr on '%s' value element" % (n.tag), sourceline=n.sourceline)
+                    if self.collect_errors:
+                        self.errors.append(err)
+                        return ''   # just to allow parsing to continue
+                    else:
+                       raise err
+                else:
+                    return ''
+
+        # user inner text as value
+        return self._parse_text(n)
+
+
 
     def _parse_text(self, node):
         text_expr = 'normalize-space(string(.))'
         return node.xpath(text_expr)
+
+
+    def _eval_as_tzinfo(self, txt):
+        """try and parse a timezone, as per value-class-pattern rules"""
+
+        tzpat = r'^(?P<tzname>(?:(?P<tzsign>[-+])(?:(?P<tzhour>\d{1,2})[:]?(?P<tzmin>\d\d)))|(?P<tzzulu>Z))$'
+
+        m = re.compile(tzpat,re.IGNORECASE).match(txt)
+        if m:
+            return self._compose_tzinfo( m.groupdict() )
+        # TODO: special case for timezones "-XX" "+XX"
+        return None
+
+
+
+    def _eval_as_time(self, txt):
+        """try and parse a time, as per value-class-pattern rules""" 
+
+        timepat = r'(?P<hour>\d{1,2})[:](?P<min>\d\d)(?:[:](?P<sec>\d\d))?'
+        ampmpat = r'(?:(?P<am>am|a[.]m[.])|(?P<pm>pm|p[.]m[.]))'
+        tzpat = r'(?P<tzname>(?:(?P<tzsign>[-+])(?:(?P<tzhour>\d{1,2})[:]?(?P<tzmin>\d\d)))|(?P<tzzulu>Z))'
+
+        # looking for time or time+timezone
+        m = re.compile("^"+timepat+ampmpat+"?"+tzpat+"?$",re.IGNORECASE).match(txt)
+        if m:
+            return self._compose_time(m.groupdict())
+
+        # special case for HHam and HHpm
+        m = re.compile(r'^(?P<hour>\d{1,2})'+ampmpat+r'?$',re.IGNORECASE).match(txt)
+        if m:
+            return self._compose_time(m.groupdict())
+        return None
+
+
+
+    def _eval_as_date(self, txt):
+        """try and parse a date, as per value-class-pattern rules""" 
+        datepat = r'^(?P<year>\d\d\d\d)-(?P<month>\d\d)-(?P<day>\d\d)$' # YYYY-MM-DD
+        m = re.compile( datepat, re.IGNORECASE ).match(txt)
+        if m:
+            return self._compose_date(m.groupdict())
+
+        orddatepat = r'^(?P<year>\d\d\d\d)-(?P<ordinalday>\d\d\d)$' # YYYY-DDD   -Ordinal date
+        m = re.compile( orddatepat, re.IGNORECASE ).match(txt)
+        if m:
+            return self._compose_date(m.groupdict())
+
+        return None
+
+
+    def _eval_as_datetime(self,txt):
+        parts = txt.split('T')
+        if len(parts) != 2:
+            return None
+        date = self._eval_as_date(parts[0])
+        time = self._eval_as_time(parts[1])
+        if date is None or time is None:
+            return None
+        return datetime.datetime.combine( date, time )
+
+
+    def _compose_tzinfo(self, g):
+        """build a tzinfo from extracted parts"""
+        if g.get('tzname') is None:
+            return None
+
+        if g['tzzulu'] is not None:
+            tzinfo = isodate.tzinfo.Utc()
+        else:
+            tzsign = ((g['tzsign'] == '-') and -1) or 1
+            tzhour = int(g['tzhour'])
+            tzmin = 0
+            if g['tzmin']:
+                tzmin = int(g['tzmin'])
+            tzinfo = isodate.tzinfo.FixedOffset(tzsign*tzhour, tzsign*tzmin, g['tzname'])
+        return tzinfo
+
+
+
+    def _compose_time(self,g):
+        """build a time object from extracted parts"""
+        # get time
+        hour = int(g['hour'])
+
+        min=0
+        if g.get('min') is not None:
+            min = int(g['min'])
+
+        sec=0
+        if g.get('sec') is not None:
+            sec = int( g['sec'] )
+
+        if g['am'] is not None:
+            if hour==12:
+                hour = 0
+        elif g['pm'] is not None:
+            if hour < 12:
+                hour += 12
+        if hour==24:
+            hour = 0
+
+        # get timezone, if any
+        tzinfo = self._compose_tzinfo(g)
+
+        return datetime.time(hour, min, sec, 0, tzinfo )
+
+    def _compose_date(self,g):
+        """build a date object from extracted parts"""
+        if 'month' in g:
+            return datetime.date(int(g['year']), int(g['month']), int(g['day']))
+        else:
+            # ordinal date YYYY-DDD
+            return datetime.date(int(g['year']),1,1 ) + datetime.timedelta(days=int(g['ordinalday'])-1)
+
+
